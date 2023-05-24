@@ -1,13 +1,3 @@
-/*
-    Gibs changes:
-        - pub struct,
-        - seperate init, update, draw functions.
-        - added fixed stepsize: noticed boids occasionally skip, simulation totally breaks if window goes
-            out of focus for a moment all numbers are multiplied by a giant framestep causing them to boof away.
-        - changed random gen to use float ranges so you dont have to as float, (but actually this is pedantic who gives a shit just you can)
-        - showing ranges need = or else you have an off by one error
-
-*/
 use rayon::prelude::*;
 
 use glam::{IVec2, Vec2};
@@ -26,16 +16,17 @@ const WINDOW_CENTER: IVec2 = IVec2 {
 };
 const WINDOW_COLOR: Color = Color::WHITE;
 
-const BOIDS_COUNT: i32 = 5000;
-const BOID_SIZE: i32 = 4;
+const BOIDS_COUNT: i32 = 1024;
+const BOID_SIZE: i32 = 3;
 const BOID_COLOR: Color = Color::BLACK;
 
-const BOID_NEIGHBOR_RADIUS: f32 = 25.0;
-const BOID_PROTECTED_RADIUS: f32 = 10.0;
+const BOID_NEIGHBOR_RADIUS: f32 = 10.0;
+const BOID_PROTECTED_RADIUS: f32 = 5.0;
+const MAX_NEIGHBOR_POPULATION: usize = 20;
 
-const BOID_SEPARATION_SCALAR: f32 = 8.0;
-const BOID_ALIGNMENT_SCALAR: f32 = 0.05;
-const BOID_COHESION_SCALAR: f32 = 0.01;
+const BOID_SEPARATION_SCALAR: f32 = 0.1;
+const BOID_ALIGNMENT_SCALAR: f32 = 0.02;
+const BOID_COHESION_SCALAR: f32 = 0.05;
 const BOID_SPEED: f32 = 2.0;
 
 const BOID_GOAL_SCALAR: f32 = 0.02;
@@ -71,7 +62,7 @@ fn main() {
         time_since_last_update += dt;
         while time_since_last_update > TIMESTEP {
             time_since_last_update -= TIMESTEP;
-            step_boids_parralel(&mut boids);
+            step_boids_parallel(&mut boids);
         }
         draw_boids(&mut rl, &thread, &boids);
     }
@@ -95,7 +86,7 @@ pub fn make_boids(boids: &mut Vec<Boid>) {
     }
 }
 
-fn step_boids_parralel(boids: &mut Vec<Boid>) {
+fn step_boids_parallel(boids: &mut Vec<Boid>) {
     let deltas: Vec<Vec2> = boids
         .par_iter()
         .map(|boid| {
@@ -203,17 +194,14 @@ pub fn calc_boids_delta(
 pub fn draw_boids(rl: &mut RaylibHandle, thread: &RaylibThread, boids: &Vec<Boid>) {
     let mut d = rl.begin_drawing(&thread);
 
-    d.clear_background(WINDOW_COLOR);
-    /*
+    // d.clear_background(WINDOW_COLOR);
     d.draw_rectangle(
         0,
         0,
         WINDOW_DIMS.x,
         WINDOW_DIMS.y,
-        Color::new(255, 255, 255, 3),
+        Color::new(255, 255, 255, 1),
     );
-    */
-
     for boid in boids.as_slice() {
         if SHOULD_DRAW_NEIGHBOR_RADIUS {
             d.draw_circle_lines(
