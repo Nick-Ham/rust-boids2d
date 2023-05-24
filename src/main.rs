@@ -1,29 +1,48 @@
-use glam::Vec2;
-use rand::{seq::IteratorRandom, thread_rng, Rng};
+/*
+    Gibs changes:
+        - pub struct,
+        - seperate init, update, draw functions.
+        - added fixed stepsize: noticed boids occasionally skip, simulation totally breaks if window goes
+            out of focus for a moment all numbers are multiplied by a giant framestep causing them to boof away.
+        - changed random gen to use float ranges so you dont have to as float, (but actually this is pedantic who gives a shit just you can)
+        - showing ranges need = or else you have an off by one error
+
+*/
+use rayon::prelude::*;
+
+use glam::{IVec2, Vec2};
+use rand::{thread_rng, Rng};
 use raylib::prelude::*;
 
-#[derive(Copy, Clone)]
-struct Boid {
+pub struct Boid {
     position: Vec2,
     direction: Vec2,
 }
 
-const WINDOW_WIDTH: i32 = 640;
-const WINDOW_HEIGHT: i32 = 480;
+const WINDOW_DIMS: IVec2 = IVec2 { x: 1280, y: 720 };
+const WINDOW_CENTER: IVec2 = IVec2 {
+    x: WINDOW_DIMS.x / 2,
+    y: WINDOW_DIMS.y / 2,
+};
 const WINDOW_COLOR: Color = Color::WHITE;
 
-const BOIDS_COUNT: i32 = 250;
-const BOID_SIZE: i32 = 2;
+const BOIDS_COUNT: i32 = 5000;
+const BOID_SIZE: i32 = 4;
 const BOID_COLOR: Color = Color::BLACK;
-const BOID_SPEED: f32 = 170.0;
 
 const BOID_NEIGHBOR_RADIUS: f32 = 25.0;
-const BOID_PROTECTED_RADIUS: f32 = 5.0;
-const BOID_SEPARATION_SCALAR: f32 = 10.0; //4.0;
-const BOID_ALIGNMENT_SCALAR: f32 = 1.5; //2.0;
-const BOID_COHESION_SCALAR: f32 = 3.9; //3.0;
-const BOID_GOAL_SCALAR: f32 = 1.9;
-const BOID_GOAL: Vec2 = Vec2::new(320.0, 240.0);
+const BOID_PROTECTED_RADIUS: f32 = 10.0;
+
+const BOID_SEPARATION_SCALAR: f32 = 8.0;
+const BOID_ALIGNMENT_SCALAR: f32 = 0.05;
+const BOID_COHESION_SCALAR: f32 = 0.01;
+const BOID_SPEED: f32 = 2.0;
+
+const BOID_GOAL_SCALAR: f32 = 0.02;
+const BOID_GOAL: Vec2 = Vec2 {
+    x: WINDOW_CENTER.x as f32,
+    y: WINDOW_CENTER.y as f32,
+};
 
 const _AFFECTOR_DISABLE_TOLERANCE: f32 = 0.01;
 
@@ -34,174 +53,203 @@ const SHOULD_DRAW_DIRECTION: bool = false;
 
 const DEBUG_DIRECTION_LENGTH: f32 = 5.0;
 
+const FRAMES_PER_SECOND: u32 = 120;
+const TIMESTEP: f32 = 1.0 / FRAMES_PER_SECOND as f32;
+
 fn main() {
-    launch_boids()
-}
-
-fn launch_boids() {
-    let mut rng = thread_rng();
     let mut boids: Vec<Boid> = Vec::new();
-
-    for _ in 0..BOIDS_COUNT {
-        let rand_x_position = rng.gen_range(1..WINDOW_WIDTH) as f32;
-        let rand_y_position = rng.gen_range(1..WINDOW_HEIGHT) as f32;
-
-        let _center_x_position = WINDOW_WIDTH as f32 / 2.0;
-        let _center_y_position = WINDOW_HEIGHT as f32 / 2.0;
-
-        let rand_rad = rng.gen_range(0.0..{ PI * 2.0 }) as f32;
-        let rand_direction = Vec2::new(rand_rad.cos(), rand_rad.sin());
-
-        let new_boid = Boid {
-            position: Vec2::new(rand_x_position, rand_y_position),
-            direction: rand_direction,
-        };
-
-        boids.push(new_boid);
-    }
+    make_boids(&mut boids);
 
     let (mut rl, thread) = raylib::init()
-        .size(WINDOW_WIDTH, WINDOW_HEIGHT)
+        .size(WINDOW_DIMS.x, WINDOW_DIMS.y)
         .title("Hello, World")
         .build();
 
-    let mut frame_start = std::time::Instant::now();
-    let mut frame_duration = 0.0;
+    let mut time_since_last_update = 0.0;
     while !rl.window_should_close() {
-        for boids_index in 0..boids.len() {
-            let mut neighboring_boids: Vec<Boid> = Vec::new();
-            let mut neighboring_boids_protected: Vec<Boid> = Vec::new();
-            let mut neighboring_boids_protected_distance_squared: Vec<f32> = Vec::new();
-            for boids_compare_index in 0..boids.len() {
-                if boids_index == boids_compare_index {
+        let dt = rl.get_frame_time();
+        time_since_last_update += dt;
+        while time_since_last_update > TIMESTEP {
+            time_since_last_update -= TIMESTEP;
+            step_boids_parralel(&mut boids);
+        }
+        draw_boids(&mut rl, &thread, &boids);
+    }
+}
+
+pub fn make_boids(boids: &mut Vec<Boid>) {
+    let mut rng = thread_rng();
+    for _ in 0..BOIDS_COUNT {
+        let new_boid = Boid {
+            position: Vec2::new(
+                rng.gen_range(1.0..WINDOW_DIMS.x as f32),
+                rng.gen_range(1.0..WINDOW_DIMS.y as f32),
+            ),
+            direction: Vec2 {
+                x: rng.gen_range(-1.0..=1.0),
+                y: rng.gen_range(-1.0..=1.0),
+            }
+            .normalize(),
+        };
+        boids.push(new_boid);
+    }
+}
+
+fn step_boids_parralel(boids: &mut Vec<Boid>) {
+    let deltas: Vec<Vec2> = boids
+        .par_iter()
+        .map(|boid| {
+            let mut neighboring_boids: Vec<&Boid> = Vec::new();
+            let mut current_min: f32 = f32::MAX;
+            let mut closest_boid = None;
+
+            for other_boid in boids.iter() {
+                if std::ptr::eq(boid, other_boid) {
                     continue;
                 }
-
-                let distance_to_neighbor_squared = (boids[boids_compare_index].position
-                    - boids[boids_index].position)
-                    .length_squared();
-
-                if distance_to_neighbor_squared > BOID_NEIGHBOR_RADIUS.powf(2.0) {
+                let dist = (other_boid.position - boid.position).length();
+                if dist > BOID_NEIGHBOR_RADIUS {
                     continue;
                 }
-
-                if distance_to_neighbor_squared < BOID_PROTECTED_RADIUS.powf(2.0) {
-                    neighboring_boids_protected.push(boids[boids_compare_index]);
-                    neighboring_boids_protected_distance_squared.push(distance_to_neighbor_squared);
+                if dist < current_min {
+                    closest_boid = Some(other_boid);
                 }
-
-                neighboring_boids.push(boids[boids_compare_index]);
+                neighboring_boids.push(other_boid);
             }
+            calc_boids_delta(&boid, &neighboring_boids, &closest_boid)
+        })
+        .collect::<Vec<_>>();
 
-            let mut cohesion_direction = Vec2::new(0.0, 0.0);
-            let mut separation_direction = Vec2::new(0.0, 0.0);
-            let mut alignment_direction = Vec2::new(0.0, 0.0);
-            let mut goal_direction = Vec2::new(0.0, 0.0);
+    for (boid, delta) in boids.iter_mut().zip(deltas.into_iter()) {
+        boid.direction = (boid.direction + delta).normalize();
+        let velocity = boid.direction * BOID_SPEED;
+        boid.position += velocity;
+    }
+}
 
-            // Cohesion
-            if !neighboring_boids.is_empty() {
-                let mut average_position_neighboring: Vec2 = boids[boids_index].position;
-                for neighboring_boid in neighboring_boids.iter() {
-                    average_position_neighboring += neighboring_boid.position;
-                }
-                average_position_neighboring /= neighboring_boids.len() as f32 + 1.0;
-                cohesion_direction = (average_position_neighboring - boids[boids_index].position)
-                    .normalize()
-                    * BOID_COHESION_SCALAR
-                    * frame_duration;
+fn step_boids(boids: &mut Vec<Boid>) {
+    for i in 0..boids.len() {
+        let mut neighboring_boids: Vec<&Boid> = Vec::new();
+
+        let boid = &boids[i];
+        let mut current_min: f32 = f32::MAX;
+        let mut closest_boid = None;
+        for other_boid in boids.iter() {
+            if std::ptr::eq(boid, other_boid) {
+                continue;
             }
-
-            // Separation
-            if !neighboring_boids_protected.is_empty() {
-                let mut nearest_boid = neighboring_boids_protected[0];
-                let mut minimum_distance = neighboring_boids_protected_distance_squared[0];
-                for protected_boid_index in 1..neighboring_boids_protected.len() {
-                    if neighboring_boids_protected_distance_squared[protected_boid_index]
-                        < minimum_distance
-                    {
-                        nearest_boid = neighboring_boids_protected[protected_boid_index];
-                        minimum_distance =
-                            neighboring_boids_protected_distance_squared[protected_boid_index];
-                    }
-                }
-                separation_direction = (boids[boids_index].position - nearest_boid.position)
-                    .normalize()
-                    * BOID_SEPARATION_SCALAR
-                    * frame_duration;
+            let dist = (other_boid.position - boid.position).length();
+            if dist > BOID_NEIGHBOR_RADIUS {
+                continue;
             }
-
-            // Alignment
-            if !neighboring_boids.is_empty() {
-                let mut average_direction: Vec2 = boids[boids_index].direction;
-                for neighboring_boid in neighboring_boids.iter() {
-                    average_direction += neighboring_boid.direction;
-                }
-                average_direction /= neighboring_boids.len() as f32 + 1.0;
-                alignment_direction =
-                    average_direction.normalize() * BOID_ALIGNMENT_SCALAR * frame_duration;
+            if dist < current_min {
+                closest_boid = Some(other_boid);
             }
-
-            // Goal
-            goal_direction = (BOID_GOAL - boids[boids_index].position).normalize()
-                * BOID_GOAL_SCALAR
-                * frame_duration;
-
-            // Affector
-            boids[boids_index].direction = (boids[boids_index].direction
-                + cohesion_direction
-                + separation_direction
-                + alignment_direction
-                + goal_direction)
-                .normalize();
-
-            let velocity = boids[boids_index].direction * BOID_SPEED * frame_duration;
-            boids[boids_index].position += velocity;
+            neighboring_boids.push(other_boid);
         }
 
-        let mut d = rl.begin_drawing(&thread);
+        let delta = calc_boids_delta(&boid, &neighboring_boids, &closest_boid);
 
-        d.clear_background(WINDOW_COLOR);
+        let boid = &mut boids[i];
+        boid.direction = (boid.direction + delta).normalize();
+        let velocity = boid.direction * BOID_SPEED;
+        boid.position += velocity;
+    }
+}
 
-        for boid in boids.as_slice() {
-            if SHOULD_DRAW_NEIGHBOR_RADIUS {
-                d.draw_circle_lines(
-                    boid.position.x as i32,
-                    boid.position.y as i32,
-                    BOID_NEIGHBOR_RADIUS,
-                    Color::GREEN,
-                );
-            }
-            if SHOULD_DRAW_PROTECTED_RADIUS {
-                d.draw_circle_lines(
-                    boid.position.x as i32,
-                    boid.position.y as i32,
-                    BOID_PROTECTED_RADIUS,
-                    Color::RED,
-                );
-            }
-            if SHOULD_DRAW_DIRECTION {
-                d.draw_line(
-                    boid.position.x as i32,
-                    boid.position.y as i32,
-                    (boid.position.x + boid.direction.x * DEBUG_DIRECTION_LENGTH) as i32,
-                    (boid.position.y + boid.direction.y * DEBUG_DIRECTION_LENGTH) as i32,
-                    Color::BLUE,
-                )
-            }
-            if SHOULD_DRAW_OPTIMIZED_BOIDS {
-                d.draw_pixel(boid.position.x as i32, boid.position.y as i32, BOID_COLOR);
-            } else {
-                d.draw_rectangle(
-                    (boid.position.x - BOID_SIZE as f32 / 2.0) as i32,
-                    (boid.position.y - BOID_SIZE as f32 / 2.0) as i32,
-                    BOID_SIZE,
-                    BOID_SIZE,
-                    BOID_COLOR,
-                )
-            }
+pub fn calc_boids_delta(
+    boid: &Boid,
+    neighboring_boids: &Vec<&Boid>,
+    closest_boid: &Option<&Boid>,
+) -> Vec2 {
+    let mut cohesion_direction = Vec2::new(0.0, 0.0);
+    let mut separation_direction = Vec2::new(0.0, 0.0);
+    let mut alignment_direction = Vec2::new(0.0, 0.0);
+
+    // Cohesion
+    if !neighboring_boids.is_empty() {
+        let mut average_position_neighboring: Vec2 = boid.position;
+        for neighboring_boid in neighboring_boids.iter() {
+            average_position_neighboring += neighboring_boid.position;
         }
+        average_position_neighboring /= neighboring_boids.len() as f32 + 1.0;
+        cohesion_direction =
+            (average_position_neighboring - boid.position).normalize() * BOID_COHESION_SCALAR;
+    }
 
-        frame_duration = frame_start.elapsed().as_secs_f32();
-        frame_start = std::time::Instant::now();
+    if let Some(closest_boid) = closest_boid {
+        let delta = (boid.position - closest_boid.position);
+        let dist_to_closest = delta.length();
+        if dist_to_closest < BOID_PROTECTED_RADIUS {
+            separation_direction = delta.normalize() * BOID_SEPARATION_SCALAR;
+        }
+    }
+
+    // Alignment
+    if !neighboring_boids.is_empty() {
+        let mut average_direction: Vec2 = boid.direction;
+        for neighboring_boid in neighboring_boids.iter() {
+            average_direction += neighboring_boid.direction;
+        }
+        average_direction /= neighboring_boids.len() as f32 + 1.0;
+        alignment_direction = average_direction.normalize() * BOID_ALIGNMENT_SCALAR;
+    }
+
+    // Goal
+    let goal_direction = (BOID_GOAL - boid.position).normalize() * BOID_GOAL_SCALAR;
+    cohesion_direction + separation_direction + alignment_direction + goal_direction
+}
+
+pub fn draw_boids(rl: &mut RaylibHandle, thread: &RaylibThread, boids: &Vec<Boid>) {
+    let mut d = rl.begin_drawing(&thread);
+
+    d.clear_background(WINDOW_COLOR);
+    /*
+    d.draw_rectangle(
+        0,
+        0,
+        WINDOW_DIMS.x,
+        WINDOW_DIMS.y,
+        Color::new(255, 255, 255, 3),
+    );
+    */
+
+    for boid in boids.as_slice() {
+        if SHOULD_DRAW_NEIGHBOR_RADIUS {
+            d.draw_circle_lines(
+                boid.position.x as i32,
+                boid.position.y as i32,
+                BOID_NEIGHBOR_RADIUS,
+                Color::GREEN,
+            );
+        }
+        if SHOULD_DRAW_PROTECTED_RADIUS {
+            d.draw_circle_lines(
+                boid.position.x as i32,
+                boid.position.y as i32,
+                BOID_PROTECTED_RADIUS,
+                Color::RED,
+            );
+        }
+        if SHOULD_DRAW_DIRECTION {
+            d.draw_line(
+                boid.position.x as i32,
+                boid.position.y as i32,
+                (boid.position.x + boid.direction.x * DEBUG_DIRECTION_LENGTH) as i32,
+                (boid.position.y + boid.direction.y * DEBUG_DIRECTION_LENGTH) as i32,
+                Color::BLUE,
+            )
+        }
+        if SHOULD_DRAW_OPTIMIZED_BOIDS {
+            d.draw_pixel(boid.position.x as i32, boid.position.y as i32, BOID_COLOR);
+        } else {
+            d.draw_rectangle(
+                (boid.position.x - BOID_SIZE as f32 / 2.0) as i32,
+                (boid.position.y - BOID_SIZE as f32 / 2.0) as i32,
+                BOID_SIZE,
+                BOID_SIZE,
+                BOID_COLOR,
+            )
+        }
     }
 }
